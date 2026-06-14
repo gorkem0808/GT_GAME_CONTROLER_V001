@@ -45,14 +45,13 @@ typedef struct {
 #define DEFAULT_P1_RELAY_PIN 26
 #define DEFAULT_P2_RELAY_PIN 27
 
-#define INACTIVE_TIMEOUT_MS 180000u
 #define RELAY_TEST_MS 1000u
 #define HID_INTERVAL_MS 10u
 #define STATUS_INTERVAL_MS 80u
 #define LOGIC_INTERVAL_MS 5u
 
 #define FLASH_TARGET_OFFSET (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
-#define CONFIG_MAGIC 0x47544332u // GTC2 - V024 trigger pin selectable
+#define CONFIG_MAGIC 0x47544333u // GTC3 - V025 selectable timeout
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -65,8 +64,9 @@ typedef struct __attribute__((packed)) {
     uint8_t p2_coin_pin;
     uint8_t p1_trigger_pin;
     uint8_t p2_trigger_pin;
+    uint16_t inactive_timeout_s; // Pasif süre saniye. Varsayılan 180.
     uint8_t keymap[21];
-    uint8_t reserved[26];
+    uint8_t reserved[24];
 } config_t;
 
 static const key_pin_t pins[] = {
@@ -125,6 +125,7 @@ static void default_config(void) {
     cfg.p2_coin_pin = DEFAULT_P2_COIN_PIN;
     cfg.p1_trigger_pin = DEFAULT_P1_TRIGGER_PIN;
     cfg.p2_trigger_pin = DEFAULT_P2_TRIGGER_PIN;
+    cfg.inactive_timeout_s = 180;
     for (uint i = 0; i < PIN_COUNT; i++) cfg.keymap[i] = pins[i].default_key;
 }
 
@@ -134,6 +135,7 @@ static bool config_valid(const config_t *c) {
     if (c->p1_relay_pin > 28 || c->p2_relay_pin > 28) return false;
     if (c->p1_coin_pin > 28 || c->p2_coin_pin > 28) return false;
     if (c->p1_trigger_pin > 28 || c->p2_trigger_pin > 28) return false;
+    if (c->inactive_timeout_s < 10 || c->inactive_timeout_s > 3600) return false;
     return true;
 }
 
@@ -243,7 +245,7 @@ static void send_config(void) {
     snprintf(buf, sizeof(buf), "CONFIG,RELAY,%s,P1COIN,%s,P2COIN,%s,RELAYPINS,%u,%u,COINPINS,%u,%u,TRIGGERPINS,%u,%u,TIMEOUT,%u\n",
              relay_mode_text(), p1_coin_text(), p2_coin_text(),
              cfg.p1_relay_pin, cfg.p2_relay_pin, cfg.p1_coin_pin, cfg.p2_coin_pin,
-             cfg.p1_trigger_pin, cfg.p2_trigger_pin, INACTIVE_TIMEOUT_MS/1000u);
+             cfg.p1_trigger_pin, cfg.p2_trigger_pin, cfg.inactive_timeout_s);
     cdc_write(buf);
 }
 
@@ -264,11 +266,11 @@ static void send_status(void) {
     for (uint i = 0; i < PIN_COUNT && n < (int)sizeof(buf)-80; i++) {
         n += snprintf(buf+n, sizeof(buf)-n, ",%u:%d", pins[i].pin, pressed_pin(pins[i].pin) ? 1 : 0);
     }
-    snprintf(buf+n, sizeof(buf)-n, ",RELAYS,%u:%d,%u:%d,ACTIVE,P1:%d,P2:%d,CFG,RELAY:%s,P1COIN:%s,P2COIN:%s,COINPINS:%u:%u,TRIGGERPINS:%u:%u\n",
+    snprintf(buf+n, sizeof(buf)-n, ",RELAYS,%u:%d,%u:%d,ACTIVE,P1:%d,P2:%d,CFG,RELAY:%s,P1COIN:%s,P2COIN:%s,COINPINS:%u:%u,TRIGGERPINS:%u:%u,TIMEOUT:%u\n",
              cfg.p1_relay_pin, p1_relay_on ? 1 : 0, cfg.p2_relay_pin, p2_relay_on ? 1 : 0,
              p1_game_active ? 1 : 0, p2_game_active ? 1 : 0,
              relay_mode_text(), p1_coin_text(), p2_coin_text(), cfg.p1_coin_pin, cfg.p2_coin_pin,
-             cfg.p1_trigger_pin, cfg.p2_trigger_pin);
+             cfg.p1_trigger_pin, cfg.p2_trigger_pin, cfg.inactive_timeout_s);
     cdc_write(buf);
 }
 
@@ -284,12 +286,13 @@ static void handle_setcfg(char *line) {
     // Formats:
     // SETCFG,HIGH,DRY,HIGH
     // SETCFG,LOW,DRY,DRY,26,27
-    // SETCFG,HIGH,DRY,DRY,26,27,3,21,7,11  -> p1 relay, p2 relay, p1 coin, p2 coin, p1 trigger, p2 trigger
+    // SETCFG,HIGH,DRY,DRY,26,27,3,21,7,11,180  -> p1 relay, p2 relay, p1 coin, p2 coin, p1 trigger, p2 trigger, timeout seconds
     char a[16] = {0}, b[16] = {0}, c[16] = {0};
     unsigned p1rp = cfg.p1_relay_pin, p2rp = cfg.p2_relay_pin;
     unsigned p1cp = cfg.p1_coin_pin,  p2cp = cfg.p2_coin_pin;
     unsigned p1tp = cfg.p1_trigger_pin, p2tp = cfg.p2_trigger_pin;
-    int got = sscanf(line + 7, "%15[^,],%15[^,],%15[^,],%u,%u,%u,%u,%u,%u", a, b, c, &p1rp, &p2rp, &p1cp, &p2cp, &p1tp, &p2tp);
+    unsigned timeout_s = cfg.inactive_timeout_s;
+    int got = sscanf(line + 7, "%15[^,],%15[^,],%15[^,],%u,%u,%u,%u,%u,%u,%u", a, b, c, &p1rp, &p2rp, &p1cp, &p2cp, &p1tp, &p2tp, &timeout_s);
     if (got >= 3) {
         if (is_low_word(a)) cfg.relay_active_low = 1; else cfg.relay_active_low = 0;
         cfg.p1_coin_active_high = is_high_word(b) ? 1 : 0;
@@ -305,6 +308,11 @@ static void handle_setcfg(char *line) {
         if (got >= 9 && p1tp <= 28 && p2tp <= 28 && p1tp != p2tp) {
             cfg.p1_trigger_pin = (uint8_t)p1tp;
             cfg.p2_trigger_pin = (uint8_t)p2tp;
+        }
+        if (got >= 10) {
+            if (timeout_s < 10) timeout_s = 10;
+            if (timeout_s > 3600) timeout_s = 3600;
+            cfg.inactive_timeout_s = (uint16_t)timeout_s;
         }
         configure_inputs();
         configure_relays();
@@ -356,6 +364,20 @@ static void handle_pin_cmd(char *line) {
     } else cdc_write("ERR,PIN_FORMAT\n");
 }
 
+static void handle_timeout_cmd(char *line) {
+    unsigned timeout_s = 0;
+    if (sscanf(line + 8, "%u", &timeout_s) == 1) {
+        if (timeout_s < 10) timeout_s = 10;
+        if (timeout_s > 3600) timeout_s = 3600;
+        cfg.inactive_timeout_s = (uint16_t)timeout_s;
+        save_config();
+        cdc_write("OK,TIMEOUT\n");
+        send_config();
+    } else {
+        cdc_write("ERR,TIMEOUT_FORMAT\n");
+    }
+}
+
 static void handle_relay(char *line) {
     unsigned player = 0, state = 1;
     if (strncmp(line, "RELAYTEST,", 10) == 0) {
@@ -375,7 +397,7 @@ static void handle_relay(char *line) {
 
 static void handle_line(char *line) {
     if (strcmp(line, "PING") == 0) {
-        cdc_write("HELLO,KEYBOARD,GT_GAME_CONTROLER_CONTROLLER,V024\n");
+        cdc_write("HELLO,KEYBOARD,GT_GAME_CONTROLER_CONTROLLER,V025\n");
     } else if (strcmp(line, "GET") == 0) {
         send_status();
     } else if (strcmp(line, "GETCFG") == 0) {
@@ -388,6 +410,8 @@ static void handle_line(char *line) {
         handle_setkey(line);
     } else if (strncmp(line, "RELAYPIN,", 9) == 0 || strncmp(line, "COINPIN,", 8) == 0 || strncmp(line, "TRIGGERPIN,", 11) == 0) {
         handle_pin_cmd(line);
+    } else if (strncmp(line, "TIMEOUT,", 8) == 0) {
+        handle_timeout_cmd(line);
     } else if (strncmp(line, "RELAYTEST,", 10) == 0 || strncmp(line, "RELAY,", 6) == 0) {
         handle_relay(line);
     } else if (strcmp(line, "RESETCFG") == 0) {
@@ -457,7 +481,7 @@ static void update_relay_logic(void) {
         } else {
             set_p1_relay(false);
         }
-        if ((uint32_t)(now - p1_last_trigger_ms) > INACTIVE_TIMEOUT_MS) {
+        if ((uint32_t)(now - p1_last_trigger_ms) > ((uint32_t)cfg.inactive_timeout_s * 1000u)) {
             p1_game_active = false;
             set_p1_relay(false);
         }
@@ -474,7 +498,7 @@ static void update_relay_logic(void) {
         } else {
             set_p2_relay(false);
         }
-        if ((uint32_t)(now - p2_last_trigger_ms) > INACTIVE_TIMEOUT_MS) {
+        if ((uint32_t)(now - p2_last_trigger_ms) > ((uint32_t)cfg.inactive_timeout_s * 1000u)) {
             p2_game_active = false;
             set_p2_relay(false);
         }
